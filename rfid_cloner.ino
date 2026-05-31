@@ -1,10 +1,10 @@
 /**
- * RFID Card Cloner v3.2 Magic
+ * RFID Card Cloner v3.7 Direct
  * 
- * After standard MIFARE_Write fails on block 0 (NAK):
- * tries Magic UID (Gen1a) backdoor write via raw TRANSCEIVE.
- * Command: 0x40 + blockNum + data[16] = 18 bytes
- * Response: 0x0A (4-bit ACK)
+ * Write block 0 IMMEDIATELY after initial card select.
+ * No reSelect, no antenna toggle between attempts.
+ * Card is freshly selected when writeMifareClassic is called.
+ * Try: Std Write A, Std Write B, change trailer then write.
  */
 
 #include <SPI.h>
@@ -106,11 +106,8 @@ void showIdle() {
 }
 
 void showCardInfo() {
-  lcd.clear(); lcd.setCursor(0,0);
-  lcd.print(cardTypeStr);
-  lcd.setCursor(0,1);
-  lcd.print(F("UID:"));
-  byte show = (lastUidLen<=4) ? lastUidLen : 5;
+  lcd.clear(); lcd.setCursor(0,0); lcd.print(cardTypeStr);
+  lcd.setCursor(0,1); lcd.print(F("UID:"));
   byte start = (lastUidLen<=4) ? 0 : lastUidLen-5;
   for (byte i=start; i<lastUidLen && i<start+5; i++) {
     if (lastUid[i]<0x10) lcd.print('0');
@@ -121,15 +118,10 @@ void showCardInfo() {
 void showAtqa() {
   lcd.clear(); lcd.setCursor(0,0);
   lcd.print(F("ATQA:"));
-  if (lastAtqa[1]<0x10) lcd.print('0');
-  lcd.print(lastAtqa[1], HEX);
-  lcd.print(' ');
-  if (lastAtqa[0]<0x10) lcd.print('0');
-  lcd.print(lastAtqa[0], HEX);
-  lcd.setCursor(0,1);
-  lcd.print(F("SAK:"));
-  if (lastSak<0x10) lcd.print('0');
-  lcd.print(lastSak, HEX);
+  if (lastAtqa[1]<0x10) lcd.print('0'); lcd.print(lastAtqa[1], HEX); lcd.print(' ');
+  if (lastAtqa[0]<0x10) lcd.print('0'); lcd.print(lastAtqa[0], HEX);
+  lcd.setCursor(0,1); lcd.print(F("SAK:"));
+  if (lastSak<0x10) lcd.print('0'); lcd.print(lastSak, HEX);
 }
 
 void showStatus() {
@@ -157,8 +149,7 @@ void printCardInfo() {
     Serial.print(lastUid[i], HEX);
     if (i<lastUidLen-1) Serial.print(' ');
   }
-  Serial.print(F(" ATQA:"));
-  Serial.print(lastAtqa[1], HEX); Serial.print(lastAtqa[0], HEX);
+  Serial.print(F(" ATQA:")); Serial.print(lastAtqa[1], HEX); Serial.print(lastAtqa[0], HEX);
   Serial.print(F(" SAK:")); Serial.print(lastSak, HEX);
   Serial.print(F(" ")); Serial.println(cardTypeStr);
 }
@@ -188,9 +179,9 @@ bool authKey(byte sector, MFRC522::MIFARE_Key *keyOut, byte cmd) {
   for (byte k=0; k<NK; k++) {
     memcpy_P(keyOut->keyByte, commonKeys[k], 6);
     if (mfrc522.PCD_Authenticate(cmd, trailerBlock, keyOut, &(mfrc522.uid))==MFRC522::STATUS_OK) {
-      Serial.print(F("  S")); Serial.print(sector);
-      if(cmd==MFRC522::PICC_CMD_MF_AUTH_KEY_B) Serial.print(F(" KB#"));
-      else Serial.print(F(" KA#"));
+      Serial.print(F("  Auth ")); 
+      if(cmd==MFRC522::PICC_CMD_MF_AUTH_KEY_B) Serial.print(F("KB#"));
+      else Serial.print(F("KA#"));
       Serial.println(k);
       return true;
     }
@@ -203,25 +194,20 @@ bool authSector(byte sector, MFRC522::MIFARE_Key *keyOut) {
   return authKey(sector, keyOut, MFRC522::PICC_CMD_MF_AUTH_KEY_B);
 }
 
-bool authKeyB(byte sector, MFRC522::MIFARE_Key *keyOut) {
-  return authKey(sector, keyOut, MFRC522::PICC_CMD_MF_AUTH_KEY_B);
-}
-
 byte getSectorCount() {
   if (lastSak==0x09) return 5;
-  if (lastSak==0x18) return 16;
   return 16;
 }
 
 bool readMifareClassic() {
   dumpSectorsCount = getSectorCount();
-  MFRC522::MIFARE_Key authKey;
+  MFRC522::MIFARE_Key akey;
   Serial.println(F("\n--- Read ---"));
 
   for (byte s=0; s<dumpSectorsCount; s++) {
     lcd.clear(); lcd.setCursor(0,0);
     lcd.print(F("Reading")); lcd.print(s+1); lcd.print(F("/")); lcd.print(dumpSectorsCount);
-    if (!authSector(s, &authKey)) { sectorStatus[s]=2; continue; }
+    if (!authSector(s, &akey)) { sectorStatus[s]=2; continue; }
     bool ok=true;
     for (byte b=0; b<BPS; b++) {
       byte bn=s*BPS+b;
@@ -250,341 +236,178 @@ bool readMifareClassic() {
   return dumpReady;
 }
 
-// Build source UID block 0 data for writing to CUID/Magic card
-void buildBlock0(byte *out) {
-  out[0] = sourceUid[0];
-  out[1] = sourceUid[1];
-  out[2] = sourceUid[2];
-  out[3] = sourceUid[3];
-  out[4] = sourceUid[0] ^ sourceUid[1] ^ sourceUid[2] ^ sourceUid[3]; // BCC
-  // Copy rest from original block 0 (SAK, ATQA, etc)
-  for (byte i=5; i<BS; i++) out[i] = cardDump[0][0][i];
-}
-
 bool writeMifareClassic() {
   if (!dumpReady) {
     showResult(F("No dump!"),F("READ first"));
-    resetPCD();
-    return false;
+    resetPCD(); return false;
   }
 
-  Serial.println(F("\n--- Write v3.2 Magic ---"));
+  Serial.println(F("\n--- Write v3.7 Direct ---"));
   Serial.print(F("  Target UID: "));
   for (byte i=0; i<mfrc522.uid.size; i++) {
     if (mfrc522.uid.uidByte[i]<0x10) Serial.print('0');
-    Serial.print(mfrc522.uid.uidByte[i], HEX);
-    Serial.print(' ');
+    Serial.print(mfrc522.uid.uidByte[i], HEX); Serial.print(' ');
   }
   Serial.println();
 
-  // ===== Prepare block 0 data with source UID =====
+  // Build block 0 with source UID
   byte newBlock0[BS];
-  buildBlock0(newBlock0);
-  Serial.print(F("  Write data: "));
-  for (byte i=0; i<BS; i++) { if(newBlock0[i]<0x10) Serial.print('0'); Serial.print(newBlock0[i],HEX); Serial.print(' '); }
+  newBlock0[0] = sourceUid[0]; newBlock0[1] = sourceUid[1];
+  newBlock0[2] = sourceUid[2]; newBlock0[3] = sourceUid[3];
+  newBlock0[4] = sourceUid[0] ^ sourceUid[1] ^ sourceUid[2] ^ sourceUid[3];
+  for (byte i=5; i<BS; i++) newBlock0[i] = cardDump[0][0][i];
+
+  Serial.print(F("  Data:"));
+  for (byte i=0;i<BS;i++) { Serial.print(' '); if(newBlock0[i]<0x10)Serial.print('0'); Serial.print(newBlock0[i],HEX); }
   Serial.println();
 
-  // ===== Step 1: Auth sector 0 =====
+  // Card is ALREADY selected (from processCardTypeA WUPA+Select)
+  // Try auth + write IMMEDIATELY without any reSelect
+
+  MFRC522::MIFARE_Key akey;
+
+  // === Try 1: Auth any key, write block 0 ===
   lcd.clear(); lcd.setCursor(0,0);
-  lcd.print(F("Target:"));
-  for (byte i=0; i<4 && i<mfrc522.uid.size; i++) printHexLcd(mfrc522.uid.uidByte[i]);
+  lcd.print(F("Auth+Write..."));
   lcd.setCursor(0,1);
-  lcd.print(F("Auth S0..."));
-  delay(1500);
+  lcd.print(F("Try 1"));
+  delay(800);
 
-  MFRC522::MIFARE_Key authKey;
-  if (!authSector(0, &authKey)) {
-    showResult(F("Auth FAIL"),F("Unknown key"));
-    Serial.println(F("  S0 AUTH FAIL"));
-    delay(3000);
-    resetCard(); resetPCD();
-    return false;
-  }
+  Serial.println(F("  --- T1: Auth any + MIFARE_Write B0 ---"));
 
-  lcd.setCursor(0,1);
-  lcd.print(F("Auth OK"));
-  Serial.println(F("  Auth OK"));
-  delay(1000);
-
-  // ===== Step 2: Try standard MIFARE_Write on block 0 =====
-  lcd.clear(); lcd.setCursor(0,0);
-  lcd.print(F("Std write B0..."));
-  delay(1000);
-
-  MFRC522::StatusCode st = mfrc522.MIFARE_Write(0, newBlock0, BS);
-  if (st == MFRC522::STATUS_OK) {
-    // Genuine CUID - standard write works!
+  if (authSector(0, &akey)) {
+    MFRC522::StatusCode st = mfrc522.MIFARE_Write(0, newBlock0, BS);
+    Serial.print(F("  Write result: ")); Serial.println((int)st);
+    if (st == MFRC522::STATUS_OK) {
+      showResult(F("CLONE OK!"), F("T1 success"));
+      Serial.println(F("  *** WRITE SUCCESS ***"));
+      mfrc522.PCD_StopCrypto1(); resetCard(); resetPCD();
+      return true;
+    }
+    // NAK = 255, TIMEOUT = 3, ERROR = 2
     lcd.clear(); lcd.setCursor(0,0);
-    lcd.print(F("Std write OK!"));
+    lcd.print(F("T1 err:")); lcd.print((int)st);
     lcd.setCursor(0,1);
-    lcd.print(F("Genuine CUID"));
-    Serial.println(F("  Standard write OK - genuine CUID!"));
-    delay(2000);
-
-    // Write blocks 1-2 normally
-    for (byte b=1; b<=2; b++) {
-      mfrc522.PCD_StopCrypto1();
-      if (!authSector(0, &authKey)) break;
-      st = mfrc522.MIFARE_Write(b, cardDump[0][b], BS);
-      Serial.print(F("  B")); Serial.print(b);
-      Serial.println(st==MFRC522::STATUS_OK ? F(" OK") : F(" FAIL"));
-    }
-
-    showResult(F("CLONE OK!"), F("Std method"));
-    Serial.println(F("*** CLONE SUCCESS (standard) ***"));
-    mfrc522.PCD_StopCrypto1(); resetCard(); resetPCD();
-    return true;
-  }
-
-  // Standard write failed - try magic
-  Serial.print(F("  Std write fail: ")); Serial.println((int)st);
-  lcd.clear(); lcd.setCursor(0,0);
-  lcd.print(F("Std fail:")); lcd.print((int)st);
-  lcd.setCursor(0,1);
-  lcd.print(F("Try magic..."));
-  delay(2000);
-
-  // ===== Step 3: Magic UID (Gen1a) write via TRANSCEIVE =====
-  // Command format: 0x40 + blockNum + data[16] = 18 bytes
-  // Must be sent while crypto1 is active (after auth)
-  // Response: 0x0A (4-bit ACK)
-
-  Serial.println(F("  Magic write via TRANSCEIVE..."));
-
-  // Re-authenticate for clean state
-  mfrc522.PCD_StopCrypto1();
-  if (!authSector(0, &authKey)) {
-    showResult(F("Re-auth FAIL"),F(""));
-    delay(2000);
-    resetCard(); resetPCD();
-    return false;
-  }
-
-  // Build magic command: 0x40 + block(0x00) + data(16 bytes) = 18 bytes
-  byte magicCmd[18];
-  magicCmd[0] = 0x40;  // Magic write command
-  magicCmd[1] = 0x00;  // Block 0
-  memcpy(&magicCmd[2], newBlock0, 16);
-
-  Serial.print(F("  Magic cmd: "));
-  for (byte i=0; i<18; i++) { if(magicCmd[i]<0x10) Serial.print('0'); Serial.print(magicCmd[i],HEX); Serial.print(' '); }
-  Serial.println();
-
-  lcd.clear(); lcd.setCursor(0,0);
-  lcd.print(F("Magic: 0x40 B0"));
-  lcd.setCursor(0,1);
-  lcd.print(F("18 bytes..."));
-  delay(1500);
-
-  byte magicResp[4] = {0};
-  byte magicRespLen = sizeof(magicResp);
-  byte validBits = 0;
-
-  st = mfrc522.PCD_TransceiveData(
-    magicCmd, 18, magicResp, &magicRespLen, &validBits, 0, true);
-
-  Serial.print(F("  Magic status: ")); Serial.println((int)st);
-  Serial.print(F("  Magic respLen: ")); Serial.println(magicRespLen);
-  if (magicRespLen > 0) {
-    Serial.print(F("  Magic resp: "));
-    for (byte i=0; i<magicRespLen; i++) { if(magicResp[i]<0x10) Serial.print('0'); Serial.print(magicResp[i],HEX); Serial.print(' '); }
-    Serial.println();
-  }
-  Serial.print(F("  ValidBits: ")); Serial.println(validBits);
-
-  // Check response: ACK is 0x0A (4 bits, so validBits should be 4)
-  if (st == MFRC522::STATUS_OK && magicRespLen > 0 && magicResp[0] == 0x0A) {
-    lcd.clear(); lcd.setCursor(0,0);
-    lcd.print(F("MAGIC OK!"));
-    lcd.setCursor(0,1);
-    lcd.print(F("ACK:0A received"));
-    Serial.println(F("  *** MAGIC WRITE SUCCESS! Card is Magic UID (Gen1a) ***"));
-    delay(3000);
-
-    // Verify: re-select and read block 0
-    mfrc522.PCD_StopCrypto1();
-    resetCard();
-    delay(5);
-    resetPCD();
-    delay(5);
-
-    byte atqa[2]; byte sz=sizeof(atqa);
-    if (mfrc522.PICC_WakeupA(atqa,&sz)==MFRC522::STATUS_OK &&
-        mfrc522.PICC_Select(&mfrc522.uid,0)==MFRC522::STATUS_OK) {
-      
-      MFRC522::MIFARE_Key vKey;
-      if (authSector(0, &vKey)) {
-        byte vBuf[BS+2]; byte vSz=sizeof(vBuf);
-        if (mfrc522.MIFARE_Read(0, vBuf, &vSz)==MFRC522::STATUS_OK) {
-          lcd.clear(); lcd.setCursor(0,0);
-          lcd.print(F("Verify B0:"));
-          for (byte i=0; i<6; i++) printHexLcd(vBuf[i]);
-          lcd.setCursor(0,1);
-          lcd.print(F("UID copied!"));
-          Serial.print(F("  Verify B0: "));
-          for (byte i=0;i<BS;i++) { if(vBuf[i]<0x10) Serial.print('0'); Serial.print(vBuf[i],HEX); Serial.print(' '); }
-          Serial.println();
-          delay(4000);
-        }
-      }
-    }
-
-    // Now write blocks 1-2 with standard method
-    mfrc522.PCD_StopCrypto1();
-    resetCard(); resetPCD();
-
-    // Re-select card
-    byte atqa2[2]; byte sz2=sizeof(atqa2);
-    if (mfrc522.PICC_WakeupA(atqa2,&sz2)==MFRC522::STATUS_OK &&
-        mfrc522.PICC_Select(&mfrc522.uid,0)==MFRC522::STATUS_OK) {
-      
-      for (byte b=1; b<=2; b++) {
-        mfrc522.PCD_StopCrypto1();
-        if (!authSector(0, &authKey)) break;
-        lcd.clear(); lcd.setCursor(0,0);
-        lcd.print(F("Write B")); lcd.print(b);
-        st = mfrc522.MIFARE_Write(b, cardDump[0][b], BS);
-        lcd.setCursor(0,1);
-        if (st==MFRC522::STATUS_OK) {
-          lcd.print(F("OK"));
-          Serial.print(F("  B")); Serial.print(b); Serial.println(F(" OK"));
-        } else {
-          lcd.print(F("ERR:")); lcd.print((int)st);
-          Serial.print(F("  B")); Serial.print(b); Serial.print(F(" ERR:")); Serial.println((int)st);
-        }
-        delay(1000);
-      }
-    }
-
-    showResult(F("CLONE OK!"), F("Magic UID!"));
-    Serial.println(F("*** FULL CLONE SUCCESS (Magic UID method) ***"));
-    mfrc522.PCD_StopCrypto1(); resetCard(); resetPCD();
-    return true;
-  }
-
-  // Magic write also failed
-  lcd.clear(); lcd.setCursor(0,0);
-  lcd.print(F("Magic fail"));
-  lcd.setCursor(0,1);
-  if (st==3) lcd.print(F("TIMEOUT"));
-  else if (magicRespLen>0) {
-    lcd.print(F("resp:"));
-    printHexLcd(magicResp[0]);
-    if (magicRespLen>1) printHexLcd(magicResp[1]);
+    if (st==255) lcd.print(F("NAK!"));
+    else if (st==3) lcd.print(F("TIMEOUT"));
+    else lcd.print(F("ERROR"));
+    Serial.print(F("  NAK - card refuses block 0 write"));
+    delay(1500);
   } else {
-    lcd.print(F("st:")); lcd.print((int)st);
+    Serial.println(F("  Auth FAIL - unknown key"));
+    lcd.clear(); lcd.setCursor(0,0); lcd.print(F("Auth FAIL!"));
+    delay(1500);
   }
 
-  Serial.print(F("  Magic write FAILED. st=")); Serial.print((int)st);
-  Serial.print(F(" respLen=")); Serial.print(magicRespLen);
-  Serial.print(F(" validBits=")); Serial.println(validBits);
-  delay(3000);
+  // === Try 2: Read current block 3, change access bits, write trailer, then write B0 ===
+  Serial.println(F("  --- T2: Change trailer access bits ---"));
+  lcd.clear(); lcd.setCursor(0,0);
+  lcd.print(F("Try 2: change"));
+  lcd.setCursor(0,1);
+  lcd.print(F("access bits"));
+  delay(800);
 
-  // ===== Step 4: Try alternative magic - 0x43 first =====
-  Serial.println(F("  Try alt magic (0x43 prefix)..."));
-  
-  mfrc522.PCD_StopCrypto1();
-  resetCard(); delay(5); resetPCD(); delay(5);
-  
-  byte atqa3[2]; byte sz3=sizeof(atqa3);
-  if (mfrc522.PICC_WakeupA(atqa3,&sz3)==MFRC522::STATUS_OK &&
-      mfrc522.PICC_Select(&mfrc522.uid,0)==MFRC522::STATUS_OK) {
-    
-    if (authSector(0, &authKey)) {
-      // Try 0x43 command first (some Magic UID variants)
-      byte cmd43[] = {0x43, 0x00};
-      byte resp43[4] = {0};
-      byte resp43Len = sizeof(resp43);
-      byte vb43 = 0;
+  // Re-auth (card should still be selected)
+  if (authSector(0, &akey)) {
+    // Read current trailer
+    byte trailer[BS];
+    byte buf[BS+2]; byte sz2=sizeof(buf);
+    if (mfrc522.MIFARE_Read(3, buf, &sz2)==MFRC522::STATUS_OK) {
+      memcpy(trailer, buf, BS);
 
-      lcd.clear(); lcd.setCursor(0,0);
-      lcd.print(F("Try 0x43..."));
-      delay(1500);
+      Serial.print(F("  Current B3:"));
+      for (byte i=0;i<BS;i++){Serial.print(' ');if(trailer[i]<0x10)Serial.print('0');Serial.print(trailer[i],HEX);}
+      Serial.println();
 
-      st = mfrc522.PCD_TransceiveData(cmd43, 2, resp43, &resp43Len, &vb43, 0, true);
-      Serial.print(F("  0x43 status: ")); Serial.println((int)st);
-      Serial.print(F("  0x43 respLen: ")); Serial.println(resp43Len);
-      if (resp43Len > 0) {
-        Serial.print(F("  0x43 resp: "));
-        for (byte i=0; i<resp43Len; i++) { if(resp43[i]<0x10) Serial.print('0'); Serial.print(resp43[i],HEX); Serial.print(' '); }
-        Serial.println();
-      }
+      // Write trailer with ALL blocks writable by Key A
+      // Access bits: FF 0F 78 = all blocks read/write with Key A
+      byte newTrailer[BS];
+      // Keep Key A as FF FF FF FF FF FF
+      newTrailer[0]=0xFF; newTrailer[1]=0xFF; newTrailer[2]=0xFF;
+      newTrailer[3]=0xFF; newTrailer[4]=0xFF; newTrailer[5]=0xFF;
+      // Access bits: FF 0F 78
+      newTrailer[6]=0xFF; newTrailer[7]=0x0F; newTrailer[8]=0x78;
+      newTrailer[9]=0x00; // GPB
+      // Keep Key B
+      memcpy(&newTrailer[10], &trailer[10], 6);
 
-      // Now try 0x40 write after 0x43
-      if (st == MFRC522::STATUS_OK) {
-        mfrc522.PCD_StopCrypto1();
-        if (authSector(0, &authKey)) {
-          byte magicResp2[4] = {0};
-          byte magicResp2Len = sizeof(magicResp2);
-          byte vb2 = 0;
+      Serial.print(F("  New B3:"));
+      for (byte i=0;i<BS;i++){Serial.print(' ');if(newTrailer[i]<0x10)Serial.print('0');Serial.print(newTrailer[i],HEX);}
+      Serial.println();
 
+      mfrc522.PCD_StopCrypto1();
+      if (authSector(0, &akey)) {
+        MFRC522::StatusCode st3 = mfrc522.MIFARE_Write(3, newTrailer, BS);
+        Serial.print(F("  Trailer write: ")); Serial.println((int)st3);
+
+        if (st3 == MFRC522::STATUS_OK) {
           lcd.clear(); lcd.setCursor(0,0);
-          lcd.print(F("Then 0x40 B0"));
-          delay(1500);
+          lcd.print(F("Trailer OK"));
+          delay(800);
 
-          st = mfrc522.PCD_TransceiveData(
-            magicCmd, 18, magicResp2, &magicResp2Len, &vb2, 0, true);
+          // Re-auth and write block 0
+          mfrc522.PCD_StopCrypto1();
+          if (authSector(0, &akey)) {
+            MFRC522::StatusCode st0 = mfrc522.MIFARE_Write(0, newBlock0, BS);
+            Serial.print(F("  B0 write: ")); Serial.println((int)st0);
 
-          Serial.print(F("  0x43+0x40 status: ")); Serial.println((int)st);
-          Serial.print(F("  0x43+0x40 respLen: ")); Serial.println(magicResp2Len);
-          if (magicResp2Len > 0) {
-            Serial.print(F("  0x43+0x40 resp: "));
-            for (byte i=0; i<magicResp2Len; i++) { if(magicResp2[i]<0x10) Serial.print('0'); Serial.print(magicResp2[i],HEX); Serial.print(' '); }
-            Serial.println();
-          }
-
-          if (st == MFRC522::STATUS_OK && magicResp2Len > 0 && magicResp2[0] == 0x0A) {
-            lcd.clear(); lcd.setCursor(0,0);
-            lcd.print(F("ALT MAGIC OK!"));
-            lcd.setCursor(0,1);
-            lcd.print(F("0x43+0x40"));
-            Serial.println(F("  *** ALT MAGIC SUCCESS (0x43 + 0x40) ***"));
-            delay(3000);
-
-            // Verify
-            mfrc522.PCD_StopCrypto1(); resetCard(); resetPCD();
-            byte atqa4[2]; byte sz4=sizeof(atqa4);
-            if (mfrc522.PICC_WakeupA(atqa4,&sz4)==MFRC522::STATUS_OK &&
-                mfrc522.PICC_Select(&mfrc522.uid,0)==MFRC522::STATUS_OK) {
-              MFRC522::MIFARE_Key vk;
-              if (authSector(0, &vk)) {
-                byte vb[BS+2]; byte vsz=sizeof(vb);
-                if (mfrc522.MIFARE_Read(0, vb, &vsz)==MFRC522::STATUS_OK) {
-                  lcd.clear(); lcd.setCursor(0,0);
-                  lcd.print(F("B0 now:"));
-                  for (byte i=0; i<6; i++) printHexLcd(vb[i]);
-                  lcd.setCursor(0,1);
-                  lcd.print(F("CLONE OK!"));
-                  delay(4000);
-                }
-              }
-              // Write B1-B2
-              mfrc522.PCD_StopCrypto1();
-              if (authSector(0, &authKey)) {
-                mfrc522.MIFARE_Write(1, cardDump[0][1], BS);
-                mfrc522.PCD_StopCrypto1();
-                if (authSector(0, &authKey)) mfrc522.MIFARE_Write(2, cardDump[0][2], BS);
-              }
+            if (st0 == MFRC522::STATUS_OK) {
+              showResult(F("CLONE OK!"), F("T2 trailer+write"));
+              mfrc522.PCD_StopCrypto1(); resetCard(); resetPCD();
+              return true;
             }
-
-            showResult(F("CLONE OK!"), F("Alt magic!"));
-            mfrc522.PCD_StopCrypto1(); resetCard(); resetPCD();
-            return true;
           }
         }
       }
-
-      lcd.clear(); lcd.setCursor(0,0);
-      lcd.print(F("Alt magic fail"));
-      lcd.setCursor(0,1);
-      lcd.print(F("Not writable"));
-      delay(3000);
     }
   }
 
-  showResult(F("CLONE FAIL"), F("Not CUID/MUID"));
-  Serial.println(F("\n*** ALL METHODS FAILED - CARD IS NOT WRITABLE ***"));
-  Serial.println(F("    Possible: regular MIFARE, used FUID, or unsupported type"));
+  // === Try 3: All 10 keys individually, write with each ===
+  Serial.println(F("  --- T3: Try all 10 keys individually ---"));
+  lcd.clear(); lcd.setCursor(0,0);
+  lcd.print(F("Try 3: all"));
+  lcd.setCursor(0,1);
+  lcd.print(F("10 keys..."));
+  delay(800);
+
+  for (byte k=0; k<NK; k++) {
+    mfrc522.PCD_StopCrypto1();
+    memcpy_P(akey.keyByte, commonKeys[k], 6);
+    
+    // Try Key A
+    if (mfrc522.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, 3, &akey, &(mfrc522.uid))==MFRC522::STATUS_OK) {
+      Serial.print(F("  KA#")); Serial.print(k);
+      MFRC522::StatusCode st = mfrc522.MIFARE_Write(0, newBlock0, BS);
+      Serial.print(F(" write=")); Serial.println((int)st);
+      if (st == MFRC522::STATUS_OK) {
+        lcd.clear(); lcd.setCursor(0,0);
+        lcd.print(F("OK! KA#")); lcd.print(k);
+        showResult(F("CLONE OK!"), F("T3 KA"));
+        mfrc522.PCD_StopCrypto1(); resetCard(); resetPCD();
+        return true;
+      }
+    }
+    // Try Key B
+    if (mfrc522.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_B, 3, &akey, &(mfrc522.uid))==MFRC522::STATUS_OK) {
+      Serial.print(F("  KB#")); Serial.print(k);
+      MFRC522::StatusCode st = mfrc522.MIFARE_Write(0, newBlock0, BS);
+      Serial.print(F(" write=")); Serial.println((int)st);
+      if (st == MFRC522::STATUS_OK) {
+        lcd.clear(); lcd.setCursor(0,0);
+        lcd.print(F("OK! KB#")); lcd.print(k);
+        showResult(F("CLONE OK!"), F("T3 KB"));
+        mfrc522.PCD_StopCrypto1(); resetCard(); resetPCD();
+        return true;
+      }
+    }
+  }
+
+  // ALL FAILED
+  showResult(F("NOT WRITABLE"), F("Regular card"));
+  Serial.println(F("\n*** CARD IS NOT CUID/FUID/MAGIC ***"));
+  Serial.println(F("    Block 0 is factory-locked (OTP)"));
+  Serial.println(F("    Need genuine CUID or PN532 programmer"));
+  delay(5000);
   mfrc522.PCD_StopCrypto1(); resetCard(); resetPCD();
   return false;
 }
@@ -669,18 +492,10 @@ void checkButton() {
 
 void updateDisplay() {
   unsigned long elapsed=millis()-cardTime;
-  if (elapsed>15000) {
-    cardActive=false; resetCard(); resetPCD(); showIdle();
-    return;
-  }
+  if (elapsed>20000) { cardActive=false; resetCard(); resetPCD(); showIdle(); return; }
   if (currentMode==MODE_DETECT) {
     byte np=(elapsed/3000)%3;
-    if (np!=screenPhase) {
-      screenPhase=np;
-      if(np==0) showCardInfo();
-      else if(np==1) showStatus();
-      else showAtqa();
-    }
+    if (np!=screenPhase) { screenPhase=np; if(np==0) showCardInfo(); else if(np==1) showStatus(); else showAtqa(); }
   }
 }
 
@@ -693,7 +508,7 @@ void setup() {
   mfrc522.PCD_SetAntennaGain(mfrc522.RxGain_max);
   memcpy_P(keyDefault.keyByte, commonKeys[0], 6);
   lcd.begin(16,2); showMode(); delay(1000); showIdle();
-  Serial.println(F("\nRFID Cloner v3.2 Magic Ready\n"));
+  Serial.println(F("\nRFID Cloner v3.7 Direct Ready\n"));
 }
 
 void loop() {
